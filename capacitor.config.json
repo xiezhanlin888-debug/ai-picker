@@ -1,0 +1,6 @@
+{
+  "appId": "com.aipicker.app",
+  "appName": "AI 选股神器",
+  "webDir": "www",
+  "bundledWebRuntime": false
+}
