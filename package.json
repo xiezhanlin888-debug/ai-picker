@@ -1,0 +1,13 @@
+{
+  "name": "ai-picker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI 选股神器 - 隔日短线量化选股 + 主力资金 + AI 分析",
+  "dependencies": {
+    "@capacitor/android": "^6.1.2",
+    "@capacitor/core": "^6.1.2"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.1.2"
+  }
+}
