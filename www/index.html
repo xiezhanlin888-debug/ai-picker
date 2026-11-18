@@ -108,11 +108,11 @@ input,textarea{user-select:text;-webkit-user-select:text}
   border-top:1px solid var(--line2);padding-bottom:env(safe-area-inset-bottom);
 }
 .tabbar button{
-  flex:1;padding:8px 2px 7px;background:none;border:none;color:var(--sub);
-  font-size:10.5px;font-weight:600;cursor:pointer;display:flex;flex-direction:column;
+  flex:1;padding:8px 1px 7px;background:none;border:none;color:var(--sub);
+  font-size:9.5px;font-weight:600;cursor:pointer;display:flex;flex-direction:column;
   align-items:center;gap:3px;transition:color .2s;position:relative;font-family:inherit;
 }
-.tabbar button .ic{font-size:18px;line-height:1;transition:transform .28s cubic-bezier(.2,1.4,.4,1)}
+.tabbar button .ic{font-size:17px;line-height:1;transition:transform .28s cubic-bezier(.2,1.4,.4,1)}
 .tabbar button.active{color:var(--blue)}
 .tabbar button.active .ic{transform:translateY(-2px) scale(1.12)}
 .tabbar button:active .ic{transform:scale(.86)}
@@ -196,6 +196,23 @@ svg.chart{width:100%;display:block;overflow:visible}
 /* 数值跳动 */
 .flash{animation:flash .5s ease}
 @keyframes flash{0%{background:var(--chip)}100%{background:transparent}}
+/* ---------- 日志 ---------- */
+.logbox{
+  max-height:58vh;overflow-y:auto;-webkit-overflow-scrolling:touch;
+  background:var(--bg2);border-radius:13px;padding:10px 11px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+.logline{font-size:11px;line-height:1.55;padding:3px 0;border-bottom:1px dashed var(--line2);word-break:break-all;animation:logIn .2s ease}
+.logline:last-child{border-bottom:none}
+.logline .tm{color:var(--sub2);margin-right:6px}
+.logline.info{color:var(--text2)}
+.logline.success{color:var(--green)}
+.logline.warn{color:var(--orange)}
+.logline.error{color:var(--red)}
+.logline.tool{color:var(--blue)}
+.logline.ai{color:var(--purple)}
+.logline.trade{color:var(--yellow);font-weight:600}
+@keyframes logIn{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:none}}
 </style>
 </head>
 <body>
@@ -213,6 +230,7 @@ svg.chart{width:100%;display:block;overflow:visible}
   <button data-tab="market"><span class="ic">◎</span>行情</button>
   <button data-tab="watch"><span class="ic">★</span>自选</button>
   <button data-tab="paper"><span class="ic">▤</span>模拟盘</button>
+  <button data-tab="log"><span class="ic">▦</span>日志</button>
   <button data-tab="settings"><span class="ic">⚙</span>设置</button>
 </nav>
 
@@ -243,7 +261,7 @@ var DEFAULTS = {
   targetPct: 2.5, stopPct: 2.5, maxPositions: 3, positionPct: 20,
   minAmount: 2, minFloatCap: 30, excludeST: true, excludeLimit: true,
   candidateCount: 30, initialCapital: 100000, costPct: 0.0005,
-  strategy: "limitup", theme: "auto"
+  strategy: "limitup", theme: "auto", autoTradeOnOpen: false
 };
 
 var STRAT = {
@@ -286,6 +304,71 @@ function applyTheme(theme) {
   if (btn) btn.textContent = theme === "auto" ? "◐" : (theme === "dark" ? "☾" : "☀");
 }
 function haptic(ms) { try { if (navigator.vibrate) navigator.vibrate(ms || 8); } catch (e) {} }
+
+/* ============================================================
+   实时日志
+   ============================================================ */
+var LOGS = [];
+function logTime(ts) {
+  var d = new Date(ts);
+  return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0") + ":" + String(d.getSeconds()).padStart(2, "0");
+}
+function logLineHtml(e) {
+  return '<span class="tm">' + logTime(e.t) + "</span>" + esc(e.msg);
+}
+function log(level, msg) {
+  var e = { t: Date.now(), level: level || "info", msg: String(msg) };
+  LOGS.push(e);
+  if (LOGS.length > 800) LOGS.shift();
+  var box = document.getElementById("logBox");
+  if (box) {
+    var d = document.createElement("div");
+    d.className = "logline " + e.level;
+    d.innerHTML = logLineHtml(e);
+    box.appendChild(d);
+    box.scrollTop = box.scrollHeight;
+    var cnt = document.getElementById("logCount");
+    if (cnt) cnt.textContent = LOGS.length + " 条";
+  }
+}
+
+/* ============================================================
+   剪贴板（兼容 WebView）
+   ============================================================ */
+function copyText(txt) {
+  return new Promise(function (resolve) {
+    function fallback() {
+      try {
+        var ta = document.createElement("textarea");
+        ta.value = txt;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        ta.style.top = "0";
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        var ok = false;
+        try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+        if (ta.parentNode) ta.remove();
+        return ok;
+      } catch (e) { return false; }
+    }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(txt).then(function () { resolve(true); }, function () { resolve(fallback()); });
+        return;
+      }
+    } catch (e) {}
+    resolve(fallback());
+  });
+}
+function doCopy(txt, label) {
+  copyText(txt).then(function (ok) {
+    haptic(10);
+    toast(ok ? (label || "已复制") : "复制失败，请手动选择文本");
+    log(ok ? "success" : "warn", "复制" + (label || "文本") + (ok ? "成功" : "失败"));
+  });
+}
 
 /* ============================================================
    工具
@@ -1151,6 +1234,89 @@ async function settleDay(a, st, plan) {
   return next;
 }
 
+function pushEquity(a) {
+  var eq = accountEquity(a, null);
+  var t = todayStr();
+  var h = a.equityHistory || [];
+  if (h.length && h[h.length - 1].date === t) h[h.length - 1].equity = eq;
+  else h.push({ date: t, equity: eq });
+  a.equityHistory = h;
+}
+
+/** 模拟盘买入（AI 可直接调用） */
+async function paperBuy(code, opts) {
+  opts = opts || {};
+  code = String(code || "").trim();
+  if (!/^\d{6}$/.test(code)) return { error: "股票代码无效，需 6 位数字" };
+  var st = loadSettings();
+  var a = loadAccount() || resetAccount(st);
+  if (a.positions.some(function (p) { return p.code === code; })) return { error: "已持有 " + code };
+  if (a.positions.length >= st.maxPositions) return { error: "已达最大持仓数 " + st.maxPositions + " 只，需先卖出" };
+
+  var quotes = await fetchQuotes([{ market: marketOf(code), code: code }]);
+  var q = quotes[0];
+  if (!q || !(q.price > 0)) return { error: "无法获取 " + code + " 的实时报价" };
+  var px = q.price;
+  var eq = accountEquity(a, null);
+  var pct = opts.positionPct ? clamp(+opts.positionPct, 1, 60) : st.positionPct;
+  var budget = eq * pct / 100;
+  var shares = Math.floor(budget / (px * 100)) * 100;
+  var cost = px * shares * (1 + st.costPct);
+  if (shares <= 0 || cost > a.cash) {
+    shares = Math.floor(a.cash / (px * 100 * (1 + st.costPct))) * 100;
+    cost = px * shares * (1 + st.costPct);
+  }
+  if (shares <= 0) return { error: "现金不足以买入一手（现价 " + px.toFixed(2) + "）" };
+
+  a.cash -= cost;
+  a.positions.push({
+    code: code, market: q.market, name: q.name, buyDate: todayStr(), buyPrice: px,
+    shares: shares, cost: cost,
+    targetPrice: r2(px * (1 + st.targetPct / 100)), stopPrice: r2(px * (1 - st.stopPct / 100))
+  });
+  a.trades.push({ date: todayStr(), code: code, name: q.name, side: "buy", price: px, shares: shares, amount: cost, reason: "AI 买入" });
+  pushEquity(a);
+  saveAccount(a);
+  log("trade", "买入 " + q.name + "(" + code + ") " + shares + "股 @" + px.toFixed(2) + " 花费" + money(cost));
+  return { ok: true, code: code, name: q.name, price: +px.toFixed(2), shares: shares, cost: Math.round(cost), target: r2(px * (1 + st.targetPct / 100)), stop: r2(px * (1 - st.stopPct / 100)), cashLeft: Math.round(a.cash) };
+}
+
+/** 模拟盘卖出（AI 可直接调用） */
+async function paperSell(code, opts) {
+  opts = opts || {};
+  code = String(code || "").trim();
+  var st = loadSettings();
+  var a = loadAccount();
+  if (!a) return { error: "模拟盘尚未初始化" };
+  var idx = -1;
+  for (var i = 0; i < a.positions.length; i++) if (a.positions[i].code === code) idx = i;
+  if (idx < 0) return { error: "未持有 " + code };
+  var p = a.positions[idx];
+  var quotes = await fetchQuotes([{ market: p.market, code: code }]);
+  var q = quotes[0];
+  var px = (q && q.price > 0) ? q.price : p.buyPrice;
+  var ratio = (opts.ratio !== undefined && isFinite(+opts.ratio)) ? clamp(+opts.ratio, 0.01, 1) : 1;
+  var shares = ratio >= 1 ? p.shares : Math.floor(p.shares * ratio / 100) * 100;
+  if (shares <= 0) shares = p.shares;
+  var amt = px * shares * (1 - st.costPct);
+  var costShare = p.cost * (shares / p.shares);
+  var pnl = amt - costShare;
+
+  a.cash += amt;
+  p.shares -= shares;
+  p.cost -= costShare;
+  if (p.shares <= 0) a.positions.splice(idx, 1);
+  a.trades.push({
+    date: todayStr(), code: code, name: p.name, side: "sell", price: px, shares: shares,
+    amount: amt, pnlAmount: pnl, pnlPct: costShare > 0 ? pnl / costShare * 100 : 0,
+    reason: opts.reason || "AI 卖出"
+  });
+  pushEquity(a);
+  saveAccount(a);
+  log("trade", "卖出 " + p.name + "(" + code + ") " + shares + "股 @" + px.toFixed(2) + " 盈亏" + (pnl >= 0 ? "+" : "") + money(pnl));
+  return { ok: true, code: code, name: p.name, price: +px.toFixed(2), shares: shares, pnl: Math.round(pnl), pnlPct: +(costShare > 0 ? pnl / costShare * 100 : 0).toFixed(2), cashLeft: Math.round(a.cash) };
+}
+
 async function closeAll(a, st) {
   if (!a || !(a.positions || []).length) return a;
   var today = todayStr();
@@ -1177,12 +1343,301 @@ async function closeAll(a, st) {
 }
 
 /* ============================================================
+   AI 智能体（Function Calling）
+   ============================================================ */
+var TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "market_overview",
+      description: "获取全市场涨跌统计、情绪指数、领涨领跌板块、成交额。需要了解大盘时先调用。",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "capital_flow",
+      description: "获取今日主力资金净流入/流出前 N 名的股票",
+      parameters: {
+        type: "object",
+        properties: { count: { type: "number", description: "返回几只，默认 5，最大 10" } }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "screen_stocks",
+      description: "按策略筛选全市场并打分，返回候选买入股（含现价/目标价/止损价/评分/理由）",
+      parameters: {
+        type: "object",
+        properties: {
+          strategy: { type: "string", enum: ["limitup", "capital", "pullback", "breakout"], description: "limitup=涨停基因 capital=主力抢筹 pullback=回踩低吸 breakout=趋势突破" },
+          count: { type: "number", description: "返回几只，默认 5，最大 8" }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "stock_detail",
+      description: "查询单只股票的实时行情、技术指标、历史回测胜率",
+      parameters: {
+        type: "object",
+        properties: { code: { type: "string", description: "6 位股票代码，如 600519" } },
+        required: ["code"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_account",
+      description: "查询模拟盘账户：总资产、现金、收益率、持仓（含成本/目标/止损）、胜率、交易笔数",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "paper_buy",
+      description: "模拟盘买入一只股票（会真实扣虚拟资金并记账）。买入前应先调用 get_account 确认仓位空间。",
+      parameters: {
+        type: "object",
+        properties: {
+          code: { type: "string", description: "6 位股票代码" },
+          positionPct: { type: "number", description: "本次使用账户总资产百分比，不填则用默认仓位" }
+        },
+        required: ["code"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "paper_sell",
+      description: "模拟盘卖出一只持仓（已到止盈/止损/隔日到期时调用）",
+      parameters: {
+        type: "object",
+        properties: {
+          code: { type: "string", description: "6 位股票代码" },
+          ratio: { type: "number", description: "卖出比例 0~1，默认全部卖出" },
+          reason: { type: "string", description: "卖出原因：止盈/止损/时间止损" }
+        },
+        required: ["code"]
+      }
+    }
+  }
+];
+
+function slimQuote(q) {
+  return {
+    code: q.code, name: q.name, price: +q.price.toFixed(2), chg: +q.changePct.toFixed(2),
+    turnover: +(q.turnover || 0).toFixed(2), volRatio: +(q.volumeRatio || 0).toFixed(2),
+    mainInflowYi: +((q.mainNetInflow || 0) / 1e8).toFixed(2), mainRatio: +(q.mainNetRatio || 0).toFixed(2),
+    industry: q.industry || ""
+  };
+}
+
+async function runTool(name, args) {
+  args = args || {};
+  try {
+    if (name === "market_overview") {
+      var q = await fetchSnapshot();
+      var p = buildPulse(q);
+      state.quotes = q; state.pulse = p; state.flow = capitalFlow(q);
+      save("aip_pulse", p);
+      if (state.flow) save("aip_flow", state.flow);
+      return {
+        source: state.source, count: p.count,
+        up: p.up, down: p.down, flat: p.flat, limitUp: p.limitUp, limitDown: p.limitDown,
+        avgChange: +p.avgChange.toFixed(2), medianChange: +p.medianChange.toFixed(2),
+        amountYi: +(p.totalAmount / 1e8).toFixed(0), sentiment: p.sentiment,
+        topIndustries: p.industries.slice(0, 5).map(function (i) { return { name: i.name, chg: +i.avgChange.toFixed(2) }; }),
+        weakIndustries: p.industries.slice(-3).map(function (i) { return { name: i.name, chg: +i.avgChange.toFixed(2) }; })
+      };
+    }
+
+    if (name === "capital_flow") {
+      var qs = state.quotes || await fetchSnapshot();
+      var f = capitalFlow(qs);
+      if (!f) return { note: "当前数据源不含主力资金数据（新浪源），请以量比与成交额判断" };
+      var n = clamp(Math.round(+args.count || 5), 1, 10);
+      return {
+        inflow: f.inflow.slice(0, n).map(slimQuote),
+        outflow: f.outflow.slice(0, n).map(slimQuote)
+      };
+    }
+
+    if (name === "screen_stocks") {
+      var st = loadSettings();
+      var strat = STRAT[args.strategy] ? args.strategy : st.strategy;
+      var cnt = clamp(Math.round(+args.count || 5), 1, 8);
+      var plan = await runDayScan({
+        targetPct: st.targetPct, stopPct: st.stopPct, maxPositions: st.maxPositions,
+        positionPct: st.positionPct, minAmount: st.minAmount, minFloatCap: st.minFloatCap,
+        excludeST: st.excludeST, excludeLimit: st.excludeLimit,
+        candidateCount: Math.max(20, st.candidateCount), strategy: strat
+      }, null);
+      state.plan = plan;
+      return {
+        strategy: STRAT[strat].label,
+        picks: plan.picks.slice(0, cnt).map(function (p) {
+          return {
+            code: p.quote.code, name: p.quote.name, price: +p.quote.price.toFixed(2),
+            chg: +p.quote.changePct.toFixed(2), score: p.score,
+            target: p.targetPrice, stop: p.stopPrice,
+            tags: p.tags.slice(0, 4),
+            backtestWinRate: p.backtest ? +p.backtest.winRate.toFixed(0) : null,
+            backtestAvg: p.backtest ? +p.backtest.avgRet.toFixed(2) : null
+          };
+        })
+      };
+    }
+
+    if (name === "stock_detail") {
+      var code = String(args.code || "").replace(/\D/g, "").slice(0, 6);
+      if (code.length !== 6) return { error: "股票代码需 6 位数字" };
+      var mk = marketOf(code);
+      var qq = (await fetchQuotes([{ market: mk, code: code }]))[0];
+      if (!qq) return { error: "未找到 " + code };
+      var k = await fetchKlines(mk, code, 120);
+      var m = k.length >= 25 ? computeMetrics(k) : null;
+      var bt = k.length >= 30 ? backtestDay(k) : null;
+      return {
+        quote: slimQuote(qq),
+        pe: qq.pe > 0 ? +qq.pe.toFixed(1) : null,
+        pb: qq.pb > 0 ? +qq.pb.toFixed(2) : null,
+        floatCapYi: +((qq.floatCap || 0) / 1e8).toFixed(1),
+        ma: m ? { ma5: +m.ma5.toFixed(2), ma10: +m.ma10.toFixed(2), ma20: +m.ma20.toFixed(2), slope20: +m.ma20Slope.toFixed(2) } : null,
+        perf: m ? { d5: +m.r5.toFixed(2), d20: +m.r20.toFixed(2), d60: +m.r60.toFixed(2), limitUps20: m.limitUps } : null,
+        risk: m ? { volatility: +m.volatility.toFixed(1), maxDrawdown60: +m.maxDrawdown.toFixed(1) } : null,
+        backtest: bt ? { trades: bt.trades, winRate: +bt.winRate.toFixed(0), avgRet: +bt.avgRet.toFixed(2), maxDD: +bt.maxDD.toFixed(1) } : null
+      };
+    }
+
+    if (name === "get_account") {
+      var a = loadAccount() || resetAccount(loadSettings());
+      var s = accountStats(a);
+      return {
+        equity: Math.round(s.equity), cash: Math.round(s.cash),
+        returnPct: +s.totalReturnPct.toFixed(2), winRate: +s.winRate.toFixed(0),
+        settledTrades: s.tradeCount, maxPositions: loadSettings().maxPositions,
+        positions: a.positions.map(function (p) {
+          return {
+            code: p.code, name: p.name, shares: p.shares, buyPrice: p.buyPrice,
+            buyDate: p.buyDate, target: p.targetPrice, stop: p.stopPrice,
+            costYi: +(p.cost / 1e4).toFixed(2)
+          };
+        })
+      };
+    }
+
+    if (name === "paper_buy") return await paperBuy(args.code, args);
+    if (name === "paper_sell") return await paperSell(args.code, args);
+
+    return { error: "未知工具：" + name };
+  } catch (e) {
+    return { error: String(e && e.message ? e.message : e) };
+  }
+}
+
+var AGENT_SYSTEM = [
+  "你是「AI 选股·短线终端」内置的 A 股短线交易智能体。",
+  "你可以调用工具获取真实行情、筛选股票、查询与操作模拟盘。",
+  "规则：",
+  "1. 所有数字必须来自工具返回，严禁编造或凭记忆给出价格。",
+  "2. 需要行情时必须先调用工具，不要向用户索要数据。",
+  "3. 买卖前先调用 get_account 确认仓位与现金；买入调用 paper_buy，卖出调用 paper_sell。",
+  "4. 严格遵守纪律：单票仓位不超设定比例，总持仓不超上限，达到止盈/止损/隔日到期必须卖出。",
+  "5. 最终回答用中文，简洁具体，必须提醒风险，结尾注明不构成投资建议。"
+].join("\n");
+
+async function chatWithTools(messages, st) {
+  var base = (st.baseUrl || "https://api.deepseek.com").replace(/\/+$/, "");
+  var r = await netFetch(base + "/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + (st.key || "") },
+    body: JSON.stringify({
+      model: st.model || "deepseek-chat",
+      messages: messages,
+      tools: TOOLS,
+      tool_choice: "auto",
+      temperature: 0.3,
+      max_tokens: 1600
+    }),
+    timeout: 90000
+  });
+  var body = await r.text();
+  if (!r.ok) throw new Error("HTTP " + r.status + " " + body.slice(0, 160));
+  var j;
+  try { j = JSON.parse(body); } catch (e) { throw new Error("AI 返回解析失败"); }
+  var msg = j && j.choices && j.choices[0] && j.choices[0].message;
+  if (!msg) throw new Error("AI 返回为空");
+  return msg;
+}
+
+async function aiAgent(task, opts) {
+  opts = opts || {};
+  var st = loadSettings();
+  if (!st.key) throw new Error("请先在「设置」填写 API Key");
+  var maxRounds = opts.maxRounds || 6;
+  log("ai", "任务开始：" + task.split("\n")[0].slice(0, 60));
+  var messages = [
+    { role: "system", content: AGENT_SYSTEM },
+    { role: "user", content: task }
+  ];
+  var toolCount = 0;
+  for (var round = 1; round <= maxRounds; round++) {
+    log("ai", "第 " + round + " 轮推理…");
+    var msg = await chatWithTools(messages, st);
+    var tcs = msg.tool_calls || [];
+    if (msg.content && (!tcs.length)) log("ai", "AI 结论：" + String(msg.content).replace(/\n/g, " ").slice(0, 200));
+    if (!tcs.length) {
+      log("success", "任务完成，共调用工具 " + toolCount + " 次");
+      return msg.content || "";
+    }
+    messages.push({ role: "assistant", content: msg.content || "", tool_calls: tcs });
+    for (var i = 0; i < tcs.length; i++) {
+      var tc = tcs[i];
+      var args = {};
+      try { args = JSON.parse(tc.function.arguments || "{}"); } catch (e) { args = {}; }
+      log("tool", "→ " + tc.function.name + "(" + JSON.stringify(args).slice(0, 90) + ")");
+      var out = await runTool(tc.function.name, args);
+      toolCount++;
+      log(out && out.error ? "warn" : "tool", "← " + tc.function.name + " " + (out && out.error ? out.error : JSON.stringify(out).slice(0, 220)));
+      messages.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify(out).slice(0, 8000) });
+      if (state.tab === "paper" || state.tab === "day") render();
+    }
+  }
+  log("warn", "达到最大工具轮数，已停止");
+  return "（已达到最大工具调用轮次，请查看日志）";
+}
+
+function buildAutoTradeTask() {
+  var st = loadSettings();
+  return [
+    "现在是 " + todayStr() + "，请执行今日短线全自动交易。步骤：",
+    "1) 调用 market_overview 了解大盘，调用 capital_flow 看主力资金；",
+    "2) 调用 screen_stocks 选出候选（策略用当前设置里的），取 5 只左右；",
+    "3) 调用 get_account 查看现有持仓与其盈亏；",
+    "4) 对已到止盈（>=目标价）、已破止损（<=止损价）或买入日期不是今天的持仓，调用 paper_sell 卖出；",
+    "5) 从候选中挑选 1~3 只当日不重复的股票调用 paper_buy 买入，单票不超 " + st.positionPct + "%，总持仓不超过 " + st.maxPositions + " 只；",
+    "6) 最终用 260 字内总结：今天买了什么（价格/股数）、卖了什么（盈亏）、为什么、明天怎么处理。",
+    "若某步失败或数据不足，如实说明，不要编造。"
+  ].join("\n");
+}
+
+/* ============================================================
    状态与渲染
    ============================================================ */
 var state = {
   tab: "day", plan: null, pulse: null, flow: null, quotes: null, indices: null,
   scanning: false, aiText: null, aiLoading: false, settling: false,
-  progText: "", progCur: 0, progTotal: 0, source: ""
+  progText: "", progCur: 0, progTotal: 0, source: "",
+  agentRunning: false, agentOut: null
 };
 var view = document.getElementById("view");
 
@@ -1207,6 +1662,10 @@ function stockRow(q, opts) {
     + '<div class="sub num" style="color:' + chgColor(q.changePct) + '">' + pct(q.changePct) + "</div></div></div>";
 }
 
+function pickCopyText(p) {
+  return p.quote.code + " " + p.quote.name + " 参考" + p.quote.price.toFixed(2) + " 目标" + p.targetPrice.toFixed(2) + " 止损" + p.stopPrice.toFixed(2);
+}
+
 function pickRow(p, rank) {
   var q = p.quote;
   var btTxt = p.backtest ? "胜率 " + p.backtest.winRate.toFixed(0) + "% · 均 " + pct(p.backtest.avgRet) : "";
@@ -1220,7 +1679,23 @@ function pickRow(p, rank) {
     + '<div class="right"><div class="score" style="color:' + scoreColor(p.score) + '">' + p.score + "</div>"
     + '<div class="sub">' + scoreLabel(p.score) + "</div>"
     + '<div class="sub" style="margin-top:4px">目标 <span class="red">' + p.targetPrice.toFixed(2) + "</span></div>"
-    + '<div class="sub">止损 <span class="green">' + p.stopPrice.toFixed(2) + "</span></div></div></div>";
+    + '<div class="sub">止损 <span class="green">' + p.stopPrice.toFixed(2) + "</span></div>"
+    + '<button class="btn sm ghost" data-copy="' + esc(pickCopyText(p)) + '" style="margin-top:6px;padding:5px 10px;font-size:11px">复制</button>'
+    + "</div></div>";
+}
+
+/* ---------- 日志 ---------- */
+function renderLog() {
+  var html = '<div class="card"><h2><span class="dot"></span>实时日志<span class="tag" id="logCount">' + LOGS.length + ' 条</span></h2>'
+    + '<div class="btns"><button class="btn ghost" id="btnLogClear">清空</button>'
+    + '<button class="btn ghost" id="btnLogCopy">复制全部</button></div></div>'
+    + '<div class="card"><div class="logbox" id="logBox">'
+    + (LOGS.length ? LOGS.map(function (e) { return '<div class="logline ' + e.level + '">' + logLineHtml(e) + "</div>"; }).join("") : '<div class="hint">暂无日志<br>扫描、AI 交易、盈亏结算的操作记录都会出现在这里</div>')
+    + "</div></div>";
+  view.innerHTML = html;
+  bindAll();
+  var box = document.getElementById("logBox");
+  if (box) box.scrollTop = box.scrollHeight;
 }
 
 /* ---------- 短线 ---------- */
@@ -1256,6 +1731,21 @@ function renderDay() {
   }
   html += '<button class="btn ghost" id="btnAI" ' + (state.aiLoading || state.scanning ? "disabled" : "") + ">"
     + (state.aiLoading ? "AI 研判中…" : "AI 研判今日市场") + "</button></div>";
+
+  // AI 全自动交易
+  html += '<div class="card"><h2><span class="dot"></span>AI 全自动交易';
+  if (state.agentRunning) html += '<span class="tag">运行中</span>';
+  else if (state.lastAutoDate) html += '<span class="tag">上次 ' + esc(state.lastAutoDate) + "</span>";
+  html += "</h2>";
+  html += '<div class="sub">AI 自己调工具取行情 → 选股 → 卖出到期/破位持仓 → 买入候选，全部写入模拟盘并记账。</div>';
+  if (state.agentOut) {
+    html += '<div style="white-space:pre-wrap;line-height:1.7;font-size:13px;color:var(--text2);margin-top:9px">' + esc(state.agentOut) + "</div>";
+  }
+  html += '<button class="btn" id="btnAgent" ' + (state.agentRunning || state.scanning ? "disabled" : "") + ">"
+    + (state.agentRunning ? '<span class="spin"></span> AI 执行中…' : "▶ 让 AI 全自动执行")
+    + '</button>'
+    + '<div class="btns"><button class="btn ghost" id="btnOpenLog">查看实时日志</button>'
+    + '<button class="btn ghost" id="btnCopyList">复制买入清单</button></div></div>';
 
   html += '<div class="card"><h2><span class="dot"></span>隔日买入计划</h2>';
   if (state.plan && state.plan.picks.length) {
@@ -1522,7 +2012,8 @@ async function refreshPositions() {
       + (hitTarget ? ' <span class="badge ok">已达止盈</span>' : hitStop ? ' <span class="badge bad">已破止损</span>' : "")
       + "</div></div>"
       + '<div class="right"><div class="num" style="font-weight:750;color:' + chgColor(pnl) + '">' + (pnl >= 0 ? "+" : "") + money(pnl) + "</div>"
-      + '<div class="sub num" style="color:' + chgColor(pp) + '">' + pct(pp) + "</div></div></div>";
+      + '<div class="sub num" style="color:' + chgColor(pp) + '">' + pct(pp) + "</div>"
+      + '<button class="btn sm ghost" data-copy="' + esc(p.code + " " + p.name + " 卖出 " + p.shares + "股 现价" + px.toFixed(2) + " 目标" + p.targetPrice.toFixed(2) + " 止损" + p.stopPrice.toFixed(2)) + '" style="margin-top:5px;padding:5px 9px;font-size:11px">复制</button></div></div>';
   });
   el.innerHTML = html;
   bindDetailClicks(el);
@@ -1571,6 +2062,9 @@ function renderSettings() {
     + '<label>接口地址</label><input id="f_baseUrl" value="' + esc(st.baseUrl) + '">'
     + '<label>模型</label><input id="f_model" value="' + esc(st.model) + '">'
     + '<label>API Key（仅本机保存）</label><input id="f_key" type="password" placeholder="sk-..." value="' + esc(st.key) + '">'
+    + '<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0">'
+    + '<span style="font-size:14px">启动时自动跑一遍 AI 交易</span>'
+    + '<button class="btn sm ' + (st.autoTradeOnOpen ? "" : "ghost") + '" id="btnAutoOpen">' + (st.autoTradeOnOpen ? "已开启" : "已关闭") + "</button></div>"
     + '<div class="btns"><button class="btn ghost" id="btnTest">测试连接</button>'
     + '<button class="btn ghost" id="btnNet">网络自检</button></div>'
     + '<div id="testOut" class="sub" style="margin-top:9px"></div>'
@@ -1709,6 +2203,8 @@ async function openDetail(code, market) {
   html += '<div class="card"><div class="btns">'
     + '<button class="btn ' + (watched ? "ghost" : "") + '" id="mWatch">' + (watched ? "已自选" : "加自选") + "</button>"
     + '<button class="btn soft" id="mAI">AI 点评</button></div>'
+    + '<div class="btns"><button class="btn ghost" id="mCopyCode">复制代码</button>'
+    + '<button class="btn ghost" id="mCopyOrder">复制下单文本</button></div>'
     + '<div id="mAIOut" class="sub" style="margin-top:11px;white-space:pre-wrap;line-height:1.7"></div></div>';
 
   html += '<div class="card"><div class="note">数据来自东方财富 / 新浪财经；AI 由 DeepSeek 生成。仅供研究，不构成投资建议。</div></div>';
@@ -1733,16 +2229,28 @@ async function openDetail(code, market) {
     openDetail(code, market);
   });
 
+  document.getElementById("mCopyCode").addEventListener("click", function () {
+    doCopy(quote.code, "股票代码");
+  });
+  document.getElementById("mCopyOrder").addEventListener("click", function () {
+    var line = quote.code + " " + quote.name + " 现价" + (quote.price > 0 ? quote.price.toFixed(2) : "-");
+    if (m) line += " MA5 " + m.ma5.toFixed(2) + " MA20 " + m.ma20.toFixed(2);
+    doCopy(line, "下单文本");
+  });
+
   document.getElementById("mAI").addEventListener("click", async function () {
     var st = loadSettings();
     var out = document.getElementById("mAIOut");
     if (!st.key) { out.textContent = "请先在「设置」填写 API Key"; return; }
     out.innerHTML = '<span class="spin"></span> AI 分析中…';
+    log("ai", "个股点评 " + quote.name + "(" + quote.code + ")");
     try {
       var txt = await aiChat(buildStockPrompt({ quote: quote, score: 70, tags: [], metrics: m, backtest: bt }), st);
       out.textContent = txt;
+      log("success", "个股点评完成 " + quote.code);
     } catch (e) {
       out.textContent = "AI 点评失败：" + (e && e.message ? e.message : String(e));
+      log("error", "个股点评失败：" + (e && e.message ? e.message : String(e)));
     }
   });
 }
@@ -1810,7 +2318,23 @@ function bind(id, fn) {
 
 function bindAll() {
   bindDetailClicks(view);
+  view.querySelectorAll("[data-copy]").forEach(function (b) {
+    if (b.__bound) return; b.__bound = true;
+    b.addEventListener("click", function (e) {
+      e.stopPropagation();
+      doCopy(b.getAttribute("data-copy"), "下单文本");
+    });
+  });
   bind("btnScan", doScan);
+  bind("btnAgent", doAgentTrade);
+  bind("btnOpenLog", function () { state.tab = "log"; render(); });
+  bind("btnCopyList", copyBuyList);
+  bind("btnLogClear", function () { LOGS.length = 0; renderLog(); toast("日志已清空"); });
+  bind("btnLogCopy", function () {
+    if (!LOGS.length) { toast("暂无日志"); return; }
+    var txt = LOGS.map(function (e) { return logTime(e.t) + " [" + e.level + "] " + e.msg; }).join("\n");
+    doCopy(txt, "日志");
+  });
   bind("btnAI", doAI);
   bind("btnSettle", doSettle);
   bind("btnRefresh", doRefreshMarket);
@@ -1831,6 +2355,7 @@ function bindAll() {
   bind("btnExport", exportData);
   bind("btnClearCache", function () { SNAP = { at: 0, data: null, source: "" }; state.quotes = null; toast("缓存已清空"); });
   bind("btnST", function () { var s = loadSettings(); s.excludeST = !s.excludeST; saveSettings(s); renderSettings(); });
+  bind("btnAutoOpen", function () { var s = loadSettings(); s.autoTradeOnOpen = !s.autoTradeOnOpen; saveSettings(s); renderSettings(); });
   bind("btnLimit", function () { var s = loadSettings(); s.excludeLimit = !s.excludeLimit; saveSettings(s); renderSettings(); });
   view.querySelectorAll("[data-strat]").forEach(function (b) {
     if (b.__bound) return; b.__bound = true;
@@ -1881,6 +2406,37 @@ async function doAI() {
   }
   state.aiLoading = false;
   renderDay();
+}
+
+async function doAgentTrade() {
+  if (state.agentRunning) return;
+  var st = loadSettings();
+  if (!st.key) { toast("请先在「设置」填写 API Key"); return; }
+  state.agentRunning = true;
+  state.agentOut = null;
+  log("ai", "===== AI 全自动交易开始 =====");
+  renderDay();
+  try {
+    var out = await aiAgent(buildAutoTradeTask(), { maxRounds: 8 });
+    state.agentOut = out || "（AI 未返回结论）";
+    var d = todayStr();
+    state.lastAutoDate = d;
+    save("aip_last_auto", d);
+    log("success", "===== AI 全自动交易结束 =====");
+    toast("AI 交易完成");
+  } catch (e) {
+    state.agentOut = "执行失败：" + (e && e.message ? e.message : String(e));
+    log("error", state.agentOut);
+    toast("AI 交易失败");
+  }
+  state.agentRunning = false;
+  renderDay();
+}
+
+function copyBuyList() {
+  if (!state.plan || !state.plan.picks.length) { toast("暂无买入计划"); return; }
+  var lines = state.plan.picks.slice(0, 5).map(function (p) { return pickCopyText(p); });
+  doCopy(lines.join("\n"), "买入清单");
 }
 
 async function doSettle() {
@@ -2011,13 +2567,14 @@ function exportData() {
    路由与启动
    ============================================================ */
 function render() {
-  var titles = { day: "短线终端", market: "市场行情", watch: "我的自选", paper: "模拟盘", settings: "设置" };
+  var titles = { day: "短线终端", market: "市场行情", watch: "我的自选", paper: "模拟盘", log: "实时日志", settings: "设置" };
   var sub = document.getElementById("subTitle");
   if (sub) sub.textContent = titles[state.tab] || "";
   if (state.tab === "day") renderDay();
   else if (state.tab === "market") renderMarket();
   else if (state.tab === "watch") renderWatch();
   else if (state.tab === "paper") renderPaper();
+  else if (state.tab === "log") renderLog();
   else renderSettings();
   document.querySelectorAll(".tabbar button").forEach(function (b) {
     b.classList.toggle("active", b.getAttribute("data-tab") === state.tab);
@@ -2051,6 +2608,8 @@ document.getElementById("btnTheme").addEventListener("click", function () {
   state.plan = load("aip_plan", null);
   state.pulse = load("aip_pulse", null);
   state.flow = load("aip_flow", null);
+  state.lastAutoDate = load("aip_last_auto", "");
+  log("info", "App 启动 · v4.0 · 网络 " + (NATIVE_HTTP ? "原生HTTP" : "fetch") + " · 数据源待探测");
   render();
 
   fetchSnapshot().then(function (q) {
@@ -2059,8 +2618,9 @@ document.getElementById("btnTheme").addEventListener("click", function () {
     state.flow = capitalFlow(q);
     save("aip_pulse", state.pulse);
     if (state.flow) save("aip_flow", state.flow);
+    log("success", "行情就绪：" + q.length + " 只 · 源 " + (state.source || "?"));
     if (state.tab === "market") renderMarket();
-  }).catch(function (e) { logNet("启动拉取失败：" + (e && e.message ? e.message : e)); });
+  }).catch(function (e) { logNet("启动拉取失败：" + (e && e.message ? e.message : e)); log("error", "行情拉取失败：" + (e && e.message ? e.message : e)); });
 
   fetchQuotes(INDICES.map(function (x) { return { market: x.market, code: x.code }; }))
     .then(function (qs) {
@@ -2079,6 +2639,12 @@ document.getElementById("btnTheme").addEventListener("click", function () {
       });
     }
   } catch (e) {}
+
+  // 可选：启动时自动交易（每天一次）
+  if (s.autoTradeOnOpen && s.key && state.lastAutoDate !== todayStr()) {
+    log("info", "已开启启动自动交易，准备执行");
+    setTimeout(function () { if (!state.agentRunning) doAgentTrade(); }, 1200);
+  }
 })();
 </script>
 </body>
