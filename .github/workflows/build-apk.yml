@@ -35,6 +35,9 @@ jobs:
       - name: Add Android platform
         run: npx cap add android
 
+      - name: Patch Android manifest (INTERNET / cleartext / network config)
+        run: node patch-android.js
+
       - name: Sync web assets
         run: npx cap sync android
 
