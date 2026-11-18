@@ -1,59 +1,67 @@
-# AI 选股神器 · 安卓版（APK）
+# AI 选股 · 短线终端 v3.0
 
-一个**隔日短线量化选股 + 主力资金 + 真实 AI 分析 + 模拟盘复利**的自包含网页应用，可直接当 PWA 用，也可打包成安卓 APK。
+隔日短线量化选股 + 主力资金 + 真实 AI 研判 + 模拟盘复利，安卓 APK / PWA 双端。
 
-## 功能
+## v3.0 重点
 
-- **短线**：AI 每日市场分析（DeepSeek）+ 短线买入计划（评分/目标价/止损价）+ 主力资金前列 + 一键结算
-- **行情**：市场情绪（涨跌/涨跌停/成交额）+ 领涨领跌榜 + 板块热度 + 主力资金净流入/流出
-- **自选**：添加/删除自选股，实时价格与涨跌
-- **模拟盘**：账户净值曲线、持仓实时盈亏（盯盘标记）、复利估算器、一键清仓、成交记录
-- **设置**：AI 接口/模型/Key、止盈止损/仓位/候选数、初始资金/费率
+### 1. 多数据源冗余（解决「刷新失败」）
+东财全市场列表接口 `clist` 已不可用（连接被断），因此改为：
 
-## 目录结构
+| 用途 | 主源 | 备源 |
+|---|---|---|
+| 全市场快照 | 东财 `clist` | **新浪财经** `Market_Center.getHQNodeData` |
+| 主力资金/量比/行业 | 东财 `ulist.np` 批量补全 | — |
+| 日 K 线 | 东财 `push2his` | — |
+
+- 启动先探测东财，失败自动切新浪（约 5579 只，4~5 秒）。
+- 候选股用东财 `ulist` 批量补全量比、主力净流入、行业、PE/PB/市值。
+- 界面右上角显示当前数据源；设置页「网络自检」可一键诊断。
+
+### 2. 主题
+日间 / 夜间 / 跟随系统，顶栏 ◐ 一键切换，选择持久化。
+
+### 3. 原生质感与动画
+- 卡片入场错落动画、按钮/行按下缩放反馈、Tab 图标弹跳
+- 骨架屏加载、加载转圈、进度条渐变
+- 触感震动（Android `navigator.vibrate`）
+- 安全区适配、滚动回弹抑制、tabular-nums 数字对齐
+
+### 4. 功能
+- **短线**：四种策略（涨停基因 / 主力抢筹 / 回踩低吸 / 趋势突破）
+- **个股详情**：K 线（收盘+MA5+MA20）、技术面、盘口估值、同风格历史回测、AI 单票点评、加自选
+- **行情**：三大指数、情绪指数、涨跌分布 11 档、板块热度、主力净流入/流出、领涨领跌
+- **自选**：实时价、浮盈、搜索添加
+- **模拟盘**：净值曲线、夏普、最大回撤、最大连亏、持仓盈亏标记、复利测算器、一键清仓
+- **设置**：AI 配置 + 交易纪律 + 筛选 + 模拟盘 + 导出数据 + 网络自检 + **保存按钮**
+
+## 工程结构
 
 ```
 ai-picker-apk/
-├── www/index.html            # 全部应用逻辑（单文件，无外部依赖）
-├── capacitor.config.json     # Capacitor 配置
-├── package.json              # 依赖清单
-├── .github/workflows/build-apk.yml   # 云端自动出 APK
+├── www/index.html            应用本体（单文件，无外部依赖）
+├── capacitor.config.json     Capacitor 配置（已启用 CapacitorHttp 原生网络）
+├── patch-android.js          构建时给 AndroidManifest 补联网权限
+├── package.json
+├── .github/workflows/build-apk.yml   云端出 APK
 └── README.md
 ```
 
-## 方式 A：直接当 App 用（PWA，无需 APK）
+## 出 APK（GitHub Actions）
 
-1. 把 `www/index.html` 传到安卓手机（微信/QQ/网盘/USB 任意方式）。
-2. 用手机浏览器（Chrome）打开这个文件。
-3. Chrome 菜单 → **「添加到主屏幕」**。
-4. 桌面出现「AI 选股神器」图标，点击即打开。
+1. 新建 GitHub 仓库（Public），上传本工程全部文件
+2. Actions → **Build APK** → Run workflow
+3. 3~6 分钟后在 Artifacts 下载 `app-debug.apk`
+4. 装到安卓手机（允许「未知来源」）
 
-> 首次使用进「设置」页填 API Key（保存在本机浏览器 localStorage）。
+或本地执行 `python3 deploy.py <token>` 自动建仓+上传+构建。
 
-## 方式 B：云端打包成真 APK（GitHub Actions）
+## 当 PWA 用（免 APK）
 
-> 说明：构建安卓 APK 需要 Android SDK + JDK 工具链，只能在云端（GitHub）跑。
-
-### 一次性的准备（5 分钟）
-
-1. 注册 GitHub 账号（免费）：https://github.com
-2. 新建仓库（名字随意，如 `ai-picker`），选 **Public**（免费额度用 Actions 需 Public）。
-3. 把本工程所有文件上传到该仓库根目录（GitHub 网页端「Add file → Upload files」直接拖入）。
-
-### 触发构建（每次要新包时）
-
-1. 仓库 → **Actions** 标签 → 左侧 **Build APK** → **Run workflow**。
-2. 等 3~6 分钟，构建完成出现 **ai-picker-debug-apk** 下载项。
-3. 下载 `app-debug.apk` → 传到安卓手机安装。
-
-### 安装注意
-
-- 这是 **debug 签名** APK，安卓会提示「未知来源」→ 允许「安装未知应用」。
-- 要正式发布/上架需配置正式签名（后续可加）。
+安卓 Chrome 打开 `www/index.html` → 菜单「添加到主屏幕」。
 
 ## 数据与安全
 
-- 行情数据来自东方财富公开接口（已确认支持浏览器跨域）。
-- AI 使用 OpenAI 兼容接口（默认 DeepSeek：`https://api.deepseek.com`，模型 `deepseek-chat`）。
-- API Key 只保存在本机（浏览器 localStorage / App WebView 本地存储），不上传。
-- 所有结果为量化信号，仅供研究，**不构成投资建议**。
+- 行情：东方财富 / 新浪财经公开接口（均允许浏览器跨域）
+- AI：OpenAI 兼容（默认 DeepSeek `https://api.deepseek.com`，模型 `deepseek-chat`）
+- API Key 仅存本机 localStorage，不上传
+- 结果仅供研究，**不构成投资建议**
