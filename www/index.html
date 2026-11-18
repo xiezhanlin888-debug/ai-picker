@@ -103,10 +103,62 @@ function sleep(ms){return new Promise(function(res){setTimeout(res,ms)})}
 function toast(msg){var t=document.createElement('div');t.className='toast';t.textContent=msg;document.body.appendChild(t);setTimeout(function(){t.remove()},2200)}
 function marketOf(code){return /^6/.test(code)?1:0}
 
+/* ================= 网络层（兼容 APK 原生 HTTP） ================= */
+var NATIVE_HTTP = null;
+try {
+  if (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.CapacitorHttp) {
+    NATIVE_HTTP = window.Capacitor.Plugins.CapacitorHttp;
+  }
+} catch (e) { NATIVE_HTTP = null }
+
+function makeResponse(status, text) {
+  return { ok: status >= 200 && status < 300, status: status, text: function () { return Promise.resolve(text) } }
+}
+
+/** 统一网络请求：APK 内优先走原生 HTTP（无 CORS），网页端回退标准 fetch */
+async function netFetch(url, opts) {
+  opts = opts || {};
+  var timeoutMs = opts.timeout || 25000;
+  var method = opts.method || 'GET';
+  var headers = opts.headers || {};
+
+  if (NATIVE_HTTP) {
+    try {
+      var payload = {};
+      payload.url = url; payload.method = method; payload.headers = headers;
+      payload.connectTimeout = timeoutMs; payload.readTimeout = timeoutMs;
+      payload.responseType = 'text';
+      if (opts.body) {
+        try { payload.data = JSON.parse(opts.body) } catch (e) { payload.data = opts.body }
+      }
+      var res = await NATIVE_HTTP.request(payload);
+      var body = res && res.data;
+      if (typeof body !== 'string') body = (body === undefined || body === null) ? '' : JSON.stringify(body);
+      return makeResponse((res && res.status) || 0, body);
+    } catch (e) {
+      // 原生失败时回退 fetch 再试一次
+    }
+  }
+
+  var ctrl = null, timer = null;
+  if (typeof AbortController !== 'undefined') {
+    ctrl = new AbortController();
+    timer = setTimeout(function () { try { ctrl.abort() } catch (e) {} }, timeoutMs);
+  }
+  try {
+    var o = { method: method, headers: headers };
+    if (opts.body) o.body = opts.body;
+    if (ctrl) o.signal = ctrl.signal;
+    return await fetch(url, o);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /* ================= 数据层 ================= */
 async function fetchJson(url,retries){retries=retries===undefined?2:retries;var err=null;
   for(var a=0;a<=retries;a++){try{
-    var r=await fetch(url,{headers:{Referer:'https://quote.eastmoney.com/'}});
+    var r=await netFetch(url,{headers:{'Referer':'https://quote.eastmoney.com/','User-Agent':'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36'}});
     if(r.ok){var t=await r.text();if(t.trim())return JSON.parse(t)}
     err=new Error('HTTP '+r.status);
   }catch(e){err=e}
@@ -271,7 +323,7 @@ function buildMarketPrompt(p,plan,inflow,outflow){var L=[];
   return L.join('\n')}
 
 async function aiChat(prompt,st){var base=(st.baseUrl||'https://api.deepseek.com').replace(/\/+$/,'');var url=base+'/chat/completions';
-  var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(st.key||'')},body:JSON.stringify({model:st.model||'deepseek-chat',messages:[{role:'system',content:'你是A股隔日短线交易助手，用简洁中文给出买卖逻辑与风险提示。'},{role:'user',content:prompt}],temperature:0.4,max_tokens:900})});
+  var r=await netFetch(url,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(st.key||'')},body:JSON.stringify({model:st.model||'deepseek-chat',messages:[{role:'system',content:'你是A股隔日短线交易助手，用简洁中文给出买卖逻辑与风险提示。'},{role:'user',content:prompt}],temperature:0.4,max_tokens:900})});
   var body=await r.text();if(!r.ok)throw new Error('AI 请求失败 HTTP '+r.status+'：'+body.slice(0,200));
   var j;try{j=JSON.parse(body)}catch(e){throw new Error('AI 返回解析失败')}
   var c=j&&j.choices&&j.choices[0]&&j.choices[0].message&&j.choices[0].message.content;
@@ -409,7 +461,8 @@ function renderSettings(){
     +'<label>接口地址</label><input id="f_baseUrl" value="'+esc(st.baseUrl)+'">'
     +'<label>模型</label><input id="f_model" value="'+esc(st.model)+'">'
     +'<label>API Key（仅存本机）</label><input id="f_key" type="password" placeholder="sk-..." value="'+esc(st.key)+'">'
-    +'<button class="btn ghost" id="btnTest">测试连接</button><div id="testOut" class="sub"></div></div>';
+    +'<button class="btn ghost" id="btnTest">测试连接</button><div id="testOut" class="sub"></div>'
+    +'<button class="btn ghost" id="btnNet">网络自检</button><div id="netOut" class="sub"></div></div>';
   html+='<div class="card"><h2>交易纪律</h2>'
     +slider('f_target','止盈目标',st.targetPct,1,8,0.5)
     +slider('f_stop','止损',st.stopPct,1,8,0.5)
@@ -433,8 +486,21 @@ function renderSettings(){
   bind('btnTest',async function(){var st=loadSettings();st.baseUrl=document.getElementById('f_baseUrl').value.trim();st.model=document.getElementById('f_model').value.trim();st.key=document.getElementById('f_key').value.trim();
     var o=document.getElementById('testOut');o.textContent='测试中…';
     try{var r=await aiChat('请只回复四个字：连接成功。',st);o.textContent='成功：'+r.slice(0,80)}catch(e){o.textContent='失败：'+e.message}})
+  bind('btnNet',netSelfTest)
   document.querySelectorAll('input[type=range]').forEach(function(inp){inp.addEventListener('input',function(){var v=document.getElementById(inp.id+'v');if(v)v.textContent=fmt(inp.id,+inp.value)})})
 }
+
+/** 网络自检：分别探测东财与 AI 接口 */
+async function netSelfTest(){var o=document.getElementById('netOut');if(!o)return;o.textContent='检测中…';
+  var lines=[];lines.push('运行环境：'+(NATIVE_HTTP?'APK 原生 HTTP':'浏览器 fetch'));
+  try{var r=await netFetch('https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=2&po=1&np=1&fltt=2&invt=2&fid=f12&fs=m:0+t:6&fields=f12,f14,f2&ut=bd1d9ddb04089700cf9c27f6f7426281',{timeout:15000});
+    var t=await r.text();lines.push('东财行情：HTTP '+r.status+(t?' · 有数据':' · 空响应'))}catch(e){lines.push('东财行情：失败 · '+(e&&e.message?e.message:String(e)))}
+  try{var k=await netFetch('https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=1.600519&fields1=f1,f2&fields2=f51,f53&klt=101&fqt=1&end=20500101&lmt=2',{timeout:15000});
+    var t2=await k.text();lines.push('东财K线：HTTP '+k.status+(t2?' · 有数据':' · 空响应'))}catch(e){lines.push('东财K线：失败 · '+(e&&e.message?e.message:String(e)))}
+  var st=loadSettings();
+  if(!st.key){lines.push('AI 接口：未填写 Key')}
+  else{try{var s=await aiChat('只回复两个字：正常',st);lines.push('AI 接口：OK · '+s.slice(0,20))}catch(e){lines.push('AI 接口：失败 · '+(e&&e.message?e.message:String(e)))}}
+  o.innerHTML=lines.map(function(l){return '<div style="margin:2px 0">'+esc(l)+'</div>'}).join('')}
 
 function bind(id,fn){var b=document.getElementById(id);if(b)b.addEventListener('click',fn)}
 
