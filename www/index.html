@@ -261,7 +261,8 @@ var DEFAULTS = {
   targetPct: 2.5, stopPct: 2.5, maxPositions: 3, positionPct: 20,
   minAmount: 2, minFloatCap: 30, excludeST: true, excludeLimit: true,
   candidateCount: 30, initialCapital: 100000, costPct: 0.0005,
-  strategy: "limitup", theme: "auto", autoTradeOnOpen: false
+  strategy: "limitup", theme: "auto", autoTradeOnOpen: false,
+  strictMode: true, tradeWindowEnabled: true
 };
 
 var STRAT = {
@@ -459,20 +460,7 @@ async function netFetch(url, opts) {
   var method = opts.method || "GET";
   var headers = opts.headers || {};
 
-  if (NATIVE_HTTP) {
-    try {
-      var p = { url: url, method: method, headers: headers, connectTimeout: timeoutMs, readTimeout: timeoutMs, responseType: "text" };
-      if (opts.body) { try { p.data = JSON.parse(opts.body); } catch (e) { p.data = opts.body; } }
-      var res = await NATIVE_HTTP.request(p);
-      var body = res && res.data;
-      if (typeof body !== "string") body = (body === undefined || body === null) ? "" : JSON.stringify(body);
-      if (body) return resp((res && res.status) || 0, body);
-      logNet("native 空响应 " + url.slice(0, 60));
-    } catch (e) {
-      logNet("native 失败 " + (e && e.message ? e.message : e) + " " + url.slice(0, 50));
-    }
-  }
-
+  // 1) 优先用 WebView 浏览器级 fetch（TLS 指纹同浏览器，兼容中国行情站 WAF）
   var ctrl = null, timer = null;
   if (typeof AbortController !== "undefined") {
     ctrl = new AbortController();
@@ -483,13 +471,27 @@ async function netFetch(url, opts) {
     if (opts.body) o.body = opts.body;
     if (ctrl) o.signal = ctrl.signal;
     var r = await fetch(url, o);
-    return r;
+    if (r) return r;
   } catch (e) {
-    logNet("fetch 失败 " + (e && e.message ? e.message : e));
-    throw e;
+    logNet("fetch 失败 " + (e && e.message ? e.message : e) + " " + url.slice(0, 50));
   } finally {
     if (timer) clearTimeout(timer);
   }
+
+  // 2) 回退：Capacitor 原生 HTTP（绕过部分 WebView 限制 / 需要免 CORS 时）
+  if (NATIVE_HTTP) {
+    try {
+      var p = { url: url, method: method, headers: headers, connectTimeout: timeoutMs, readTimeout: timeoutMs, responseType: "text" };
+      if (opts.body) { try { p.data = JSON.parse(opts.body); } catch (e) { p.data = opts.body; } }
+      var res = await NATIVE_HTTP.request(p);
+      var body = res && res.data;
+      if (typeof body !== "string") body = (body === undefined || body === null) ? "" : JSON.stringify(body);
+      return resp((res && res.status) || 0, body);
+    } catch (e) {
+      logNet("native 失败 " + (e && e.message ? e.message : e));
+    }
+  }
+  throw new Error("网络请求失败");
 }
 
 async function getJson(url, retries, headers) {
@@ -712,6 +714,72 @@ async function enrich(quotes) {
 }
 
 function isST(name) { return /ST|退|N |C /i.test(String(name).replace(/\s/g, "")); }
+
+/* ============================================================
+   交易时段 & 严格尾盘策略（8 条规则）
+   ============================================================ */
+function nowMinutes() {
+  var d = new Date();
+  return d.getHours() * 60 + d.getMinutes();
+}
+function isTradingDay() {
+  var day = new Date().getDay();
+  return day >= 1 && day <= 5; // 周一~周五
+}
+function inTradeWindow() {
+  return isTradingDay() && nowMinutes() >= (14 * 60 + 30) && nowMinutes() <= (15 * 60);
+}
+function tradeWindowText() {
+  var d = new Date();
+  var hh = String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  if (!isTradingDay()) return "周末/非交易日";
+  if (inTradeWindow()) return "交易时段 14:30–15:00";
+  return hh + " 非交易时段";
+}
+
+/**
+ * 严格尾盘 8 规则（硬过滤，逐条对应）：
+ *  1 时间    → 由交易时段闸门控制（tradeWindowEnabled）
+ *  2 主板涨幅 3–5%
+ *  3 近20日涨停 → 需 K 线（在评分阶段过滤）
+ *  4 量比 ≥1
+ *  5 换手 5–10%
+ *  6 总市值 50–200 亿
+ *  7 分时站上均价（现价 ≥ 成交均价，且最低价未深跌破均价）
+ *  8 强于大盘（涨幅 > 基准 + 0.5）
+ */
+function strictFilter(q, benchmark) {
+  if (!q.code || !q.name) return false;
+  if (q.price <= 0) return false;
+  // 规则2：主板 + 涨幅 3%–5%（60沪主板 / 00深主板，排除 30创业板、68/689科创板、8/4/92北交所）
+  var isMain = /^60/.test(q.code) || /^00/.test(q.code);
+  if (!isMain) return false;
+  if (q.changePct < 3 || q.changePct > 5) return false;
+  // 规则4：量比≥1 —— 新浪源无量比，改为 enrich 补全后再过滤（见 runDayScan）
+  // 规则5：换手 5%–10%
+  if ((q.turnover || 0) < 5 || (q.turnover || 0) > 10) return false;
+  // 规则6：总市值 50–200 亿
+  if (q.totalCap < 50e8 || q.totalCap > 200e8) return false;
+  // 规则7：分时站上均价（均价 = 成交额 / 成交量，最低价未深跌破均价）
+  var vwap = (q.volume > 0 && q.amount > 0) ? q.amount / (q.volume * 100) : 0;
+  if (vwap > 0 && q.price < vwap) return false;
+  if (vwap > 0 && q.low > 0 && q.low < vwap * 0.98) return false;
+  // 规则8：强于大盘
+  if (benchmark !== null && benchmark !== undefined && isFinite(benchmark)) {
+    if (q.changePct <= benchmark + 0.5) return false;
+  }
+  return true;
+}
+function strictRuleTags(q, benchmark, limitUps) {
+  var tags = [];
+  if (q.changePct >= 3 && q.changePct <= 5) tags.push("涨幅3-5%");
+  if ((q.volumeRatio || 0) >= 1) tags.push("量比≥1");
+  if ((q.turnover || 0) >= 5 && (q.turnover || 0) <= 10) tags.push("换手5-10%");
+  if (q.totalCap >= 50e8 && q.totalCap <= 200e8) tags.push("市值50-200亿");
+  if (limitUps >= 1) tags.push("20日有涨停");
+  if (benchmark !== null && benchmark !== undefined && q.changePct > benchmark) tags.push("强于大盘");
+  return tags;
+}
 
 /* ============================================================
    市场统计
@@ -947,25 +1015,71 @@ async function runDayScan(st, onP) {
   }, true);
   if (!quotes.length) throw new Error("行情获取失败");
 
-  var filtered = quotes.filter(function (q) {
-    if (!q.code || !q.name) return false;
-    if (q.price <= 0) return false;
-    if (st.excludeST && isST(q.name)) return false;
-    if (q.name.indexOf("退") >= 0) return false;
-    if (st.excludeLimit && (q.changePct >= 9.5 || q.changePct <= -9.5)) return false;
-    if (q.floatCap > 0 && q.floatCap < st.minFloatCap * 1e8) return false;
-    if (q.amount < st.minAmount * 1e8) return false;
-    return true;
-  });
-  if (!filtered.length) throw new Error("过滤后无符合条件的股票，请放宽条件");
-
   var pulse = buildPulse(quotes);
+
+  // 大盘基准：优先上证指数，失败用全市场平均涨幅
+  var benchmark = pulse.avgChange;
+  try {
+    var idx = await fetchQuotes([{ market: 1, code: "000001" }]);
+    if (idx[0] && isFinite(idx[0].changePct)) benchmark = idx[0].changePct;
+  } catch (e) {}
+
+  var filtered;
+  if (st.strictMode) {
+    if (onP) onP("严格尾盘 8 规则过滤中…", 0, quotes.length);
+    filtered = quotes.filter(function (q) {
+      if (st.excludeST && isST(q.name)) return false;
+      return strictFilter(q, benchmark);
+    });
+  } else {
+    filtered = quotes.filter(function (q) {
+      if (!q.code || !q.name) return false;
+      if (q.price <= 0) return false;
+      if (st.excludeST && isST(q.name)) return false;
+      if (q.name.indexOf("退") >= 0) return false;
+      if (st.excludeLimit && (q.changePct >= 9.5 || q.changePct <= -9.5)) return false;
+      if (q.floatCap > 0 && q.floatCap < st.minFloatCap * 1e8) return false;
+      if (q.amount < st.minAmount * 1e8) return false;
+      return true;
+    });
+  }
+  var finalize = function (picks, note) {
+    var plan = { picks: picks || [], pulse: pulse, updatedAt: Date.now(), strategy: st.strategy, source: SNAP.source, strictMode: !!st.strictMode, benchmark: benchmark, note: note || "" };
+    state.plan = plan;
+    state.pulse = pulse;
+    state.flow = capitalFlow(quotes);
+    state.quotes = quotes;
+    save("aip_plan", plan);
+    save("aip_pulse", pulse);
+    if (state.flow) save("aip_flow", state.flow);
+    return plan;
+  };
+
+  if (!filtered.length) {
+    if (st.strictMode) {
+      var btxt = isFinite(benchmark) ? (benchmark >= 0 ? "+" : "") + benchmark.toFixed(2) + "%" : "--";
+      return finalize([], "今日大盘 " + btxt + "，严格尾盘 8 规则无一标的全部满足（主板 3-5% + 量比≥1 + 换手5-10% + 市值50-200亿 + 站上均价 + 强于大盘 + 近20日有涨停），弱势日空仓属正常，请 14:30–15:00 再看。");
+    }
+    throw new Error("过滤后无符合条件的股票，请放宽条件");
+  }
+
   var indMap = {};
   pulse.industries.forEach(function (x) { indMap[x.name] = x.avgChange; });
 
-  var cands = preRank(filtered, st);
-  if (onP) onP("补全主力资金与行业…", 0, cands.length);
+  // 严格模式候选较少，直接全部拉 K 线；否则预排序取候选
+  var cands;
+  if (st.strictMode) {
+    cands = filtered.slice(0, 120);
+  } else {
+    cands = preRank(filtered, st);
+  }
+  if (onP) onP("补全量比、主力资金与行业…", 0, cands.length);
   await enrich(cands);
+
+  // 规则4：量比≥1（新浪源无量比，需东财补全后再过滤）
+  if (st.strictMode) {
+    cands = cands.filter(function (q) { return (q.volumeRatio || 0) >= 1; });
+  }
 
   if (onP) onP("获取日线并评分…", 0, cands.length);
   var done = 0, scored = [];
@@ -977,28 +1091,27 @@ async function runDayScan(st, onP) {
       done++;
       if (onP) onP("评分中 " + done + "/" + cands.length, done, cands.length);
       if (k.length < 25) return null;
+      var m = computeMetrics(k);
+      // 规则3：近20日必须有涨停
+      if (st.strictMode && m.limitUps < 1) return null;
       var pick = dayScore(quote, k, indMap[quote.industry] || 0, st.strategy);
       pick.targetPrice = r2(quote.price * (1 + st.targetPct / 100));
       pick.stopPrice = r2(quote.price * (1 - st.stopPct / 100));
       pick.targetPct = st.targetPct;
       pick.stopPct = st.stopPct;
       pick.backtest = backtestDay(k);
+      if (st.strictMode) pick.tags = strictRuleTags(quote, benchmark, m.limitUps);
       return pick;
     }));
     rs.forEach(function (s) { if (s) scored.push(s); });
   }
-  if (!scored.length) throw new Error("候选股日线不足，请重试");
+  if (!scored.length) {
+    if (st.strictMode) return finalize([], "今日无近 20 日有涨停的候选（其余规则已过），弱势日空仓属正常，请 14:30–15:00 再看。");
+    throw new Error("候选股日线不足，请重试");
+  }
 
   scored.sort(function (a, b) { return b.score - a.score; });
-  var plan = { picks: scored.slice(0, 12), pulse: pulse, updatedAt: Date.now(), strategy: st.strategy, source: SNAP.source };
-  state.plan = plan;
-  state.pulse = pulse;
-  state.flow = capitalFlow(quotes);
-  state.quotes = quotes;
-  save("aip_plan", plan);
-  save("aip_pulse", pulse);
-  if (state.flow) save("aip_flow", state.flow);
-  return plan;
+  return finalize(scored.slice(0, 12), "");
 }
 
 /* ============================================================
@@ -1249,6 +1362,7 @@ async function paperBuy(code, opts) {
   code = String(code || "").trim();
   if (!/^\d{6}$/.test(code)) return { error: "股票代码无效，需 6 位数字" };
   var st = loadSettings();
+  if (st.tradeWindowEnabled && !inTradeWindow()) return { error: "非交易时段（14:30–15:00）禁止下单，当前 " + tradeWindowText() };
   var a = loadAccount() || resetAccount(st);
   if (a.positions.some(function (p) { return p.code === code; })) return { error: "已持有 " + code };
   if (a.positions.length >= st.maxPositions) return { error: "已达最大持仓数 " + st.maxPositions + " 只，需先卖出" };
@@ -1286,6 +1400,7 @@ async function paperSell(code, opts) {
   opts = opts || {};
   code = String(code || "").trim();
   var st = loadSettings();
+  if (st.tradeWindowEnabled && !inTradeWindow()) return { error: "非交易时段（14:30–15:00）禁止卖出，当前 " + tradeWindowText() };
   var a = loadAccount();
   if (!a) return { error: "模拟盘尚未初始化" };
   var idx = -1;
@@ -1479,6 +1594,7 @@ async function runTool(name, args) {
         targetPct: st.targetPct, stopPct: st.stopPct, maxPositions: st.maxPositions,
         positionPct: st.positionPct, minAmount: st.minAmount, minFloatCap: st.minFloatCap,
         excludeST: st.excludeST, excludeLimit: st.excludeLimit,
+        strictMode: st.strictMode, tradeWindowEnabled: st.tradeWindowEnabled,
         candidateCount: Math.max(20, st.candidateCount), strategy: strat
       }, null);
       state.plan = plan;
@@ -1619,13 +1735,14 @@ async function aiAgent(task, opts) {
 function buildAutoTradeTask() {
   var st = loadSettings();
   return [
-    "现在是 " + todayStr() + "，请执行今日短线全自动交易。步骤：",
+    "现在是 " + todayStr() + " " + tradeWindowText() + "，请执行今日短线全自动交易。步骤：",
     "1) 调用 market_overview 了解大盘，调用 capital_flow 看主力资金；",
-    "2) 调用 screen_stocks 选出候选（策略用当前设置里的），取 5 只左右；",
+    "2) 调用 screen_stocks 选出候选（已按严格尾盘 8 规则过滤：主板涨幅3-5%、量比≥1、换手5-10%、市值50-200亿、站上均价、强于大盘、近20日有涨停），取 5 只左右；",
     "3) 调用 get_account 查看现有持仓与其盈亏；",
     "4) 对已到止盈（>=目标价）、已破止损（<=止损价）或买入日期不是今天的持仓，调用 paper_sell 卖出；",
     "5) 从候选中挑选 1~3 只当日不重复的股票调用 paper_buy 买入，单票不超 " + st.positionPct + "%，总持仓不超过 " + st.maxPositions + " 只；",
     "6) 最终用 260 字内总结：今天买了什么（价格/股数）、卖了什么（盈亏）、为什么、明天怎么处理。",
+    "注意：若不在 14:30–15:00 交易时段，paper_buy/paper_sell 会拒绝执行，此时如实说明「当前非交易时段，已停止下单」，不要编造成交。",
     "若某步失败或数据不足，如实说明，不要编造。"
   ].join("\n");
 }
@@ -1716,8 +1833,14 @@ function renderDay() {
     html += '<button data-strat="' + k + '" class="' + (st.strategy === k ? "active" : "") + '">' + STRAT[k].label + "</button>";
   });
   html += '</div><div class="note" style="margin-top:9px">' + esc(STRAT[st.strategy] ? STRAT[st.strategy].tip : "") + "</div>"
+    + '<div class="sub" style="margin-top:9px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">'
+    + (st.strictMode ? '<span class="badge ok">严格尾盘 8 规则</span>' : '<span class="badge">宽选模式</span>')
+    + (st.tradeWindowEnabled
+      ? (inTradeWindow() ? '<span class="badge ok">交易时段 14:30–15:00</span>' : '<span class="badge warn">' + esc(tradeWindowText()) + '</span>')
+      : '<span class="badge">闸门已关</span>')
+    + "</div>"
     + '<button class="btn" id="btnScan" ' + (state.scanning ? "disabled" : "") + ">"
-    + (state.scanning ? '<span class="spin"></span> 扫描中…' : "扫描全市场 · " + (st.candidateCount) + " 只候选")
+    + (state.scanning ? '<span class="spin"></span> 扫描中…' : (st.strictMode ? "尾盘扫描 · 8 规则" : "扫描全市场 · " + (st.candidateCount) + " 只候选"))
     + "</button></div>";
 
   html += '<div class="card"><h2><span class="dot"></span>AI 市场研判'
@@ -1751,6 +1874,8 @@ function renderDay() {
   if (state.plan && state.plan.picks.length) {
     html += state.plan.picks.map(function (p, i) { return pickRow(p, i + 1); }).join("");
     html += '<div class="note" style="margin-top:9px">T+1：今日尾盘选 → 次日买入 → 第三日冲高止盈。点个股看详情。</div>';
+  } else if (state.plan && state.plan.note) {
+    html += '<div class="hint" style="text-align:left;color:var(--orange)">' + esc(state.plan.note) + '</div>';
   } else {
     html += '<div class="hint">未扫描<br>点上方「扫描全市场」，约 10 秒出结果</div>';
   }
@@ -2088,6 +2213,18 @@ function renderSettings() {
     + '<button class="btn sm ' + (st.excludeLimit ? "" : "ghost") + '" id="btnLimit">' + (st.excludeLimit ? "已开启" : "已关闭") + "</button></div>"
     + "</div>";
 
+  // 严格尾盘 8 规则
+  html += '<div class="card"><h2><span class="dot"></span>严格尾盘策略（8 规则）</h2>'
+    + '<div class="sub" style="margin-bottom:4px">当前 ' + esc(tradeWindowText()) + '</div>'
+    + '<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0">'
+    + '<span style="font-size:14px">严格模式（主板 3-5% + 量比≥1 + 换手5-10% + 市值50-200亿 + 站上均价 + 强于大盘 + 近20日涨停）</span>'
+    + '<button class="btn sm ' + (st.strictMode ? "" : "ghost") + '" id="btnStrict">' + (st.strictMode ? "已开启" : "已关闭") + "</button></div>"
+    + '<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0">'
+    + '<span style="font-size:14px">交易时段闸门（仅 14:30–15:00 允许下单）</span>'
+    + '<button class="btn sm ' + (st.tradeWindowEnabled ? "" : "ghost") + '" id="btnWindow">' + (st.tradeWindowEnabled ? "已开启" : "已关闭") + "</button></div>"
+    + '<div class="note">关闭闸门仅用于测试；实盘请保持开启，避开早盘假信号与日内波动。</div>'
+    + "</div>";
+
   html += '<div class="card"><h2><span class="dot"></span>模拟盘</h2>'
     + slider("f_cap", "初始资金", st.initialCapital, 10000, 1000000, 10000)
     + slider("f_cost", "单边费率", Math.round(st.costPct * 10000), 0, 20, 1)
@@ -2357,6 +2494,8 @@ function bindAll() {
   bind("btnST", function () { var s = loadSettings(); s.excludeST = !s.excludeST; saveSettings(s); renderSettings(); });
   bind("btnAutoOpen", function () { var s = loadSettings(); s.autoTradeOnOpen = !s.autoTradeOnOpen; saveSettings(s); renderSettings(); });
   bind("btnLimit", function () { var s = loadSettings(); s.excludeLimit = !s.excludeLimit; saveSettings(s); renderSettings(); });
+  bind("btnStrict", function () { var s = loadSettings(); s.strictMode = !s.strictMode; saveSettings(s); renderSettings(); });
+  bind("btnWindow", function () { var s = loadSettings(); s.tradeWindowEnabled = !s.tradeWindowEnabled; saveSettings(s); renderSettings(); });
   view.querySelectorAll("[data-strat]").forEach(function (b) {
     if (b.__bound) return; b.__bound = true;
     b.addEventListener("click", function () {
@@ -2379,9 +2518,16 @@ async function doScan() {
       if (bar && total > 0) bar.style.width = Math.round(cur / total * 100) + "%";
       if (txt) txt.textContent = msg;
     });
-    toast("扫描完成 · " + state.plan.picks.length + " 只入选");
+    if (state.plan && state.plan.note && !state.plan.picks.length) {
+      toast("今日无符合标的");
+      log("warn", state.plan.note);
+    } else {
+      toast("扫描完成 · " + state.plan.picks.length + " 只入选");
+    }
   } catch (e) {
-    alert("扫描失败：" + (e && e.message ? e.message : String(e)));
+    var msg = (e && e.message ? e.message : String(e));
+    log("error", "扫描失败：" + msg);
+    toast("扫描失败：" + msg);
   }
   state.scanning = false;
   renderDay();
@@ -2412,6 +2558,14 @@ async function doAgentTrade() {
   if (state.agentRunning) return;
   var st = loadSettings();
   if (!st.key) { toast("请先在「设置」填写 API Key"); return; }
+  if (st.tradeWindowEnabled && !inTradeWindow()) {
+    var msg = "当前 " + tradeWindowText() + "，不在交易时段（14:30–15:00），已停止自动交易。";
+    state.agentOut = msg;
+    log("warn", msg);
+    toast(msg);
+    renderDay();
+    return;
+  }
   state.agentRunning = true;
   state.agentOut = null;
   log("ai", "===== AI 全自动交易开始 =====");
@@ -2441,6 +2595,12 @@ function copyBuyList() {
 
 async function doSettle() {
   if (state.settling) return;
+  var st = loadSettings();
+  if (st.tradeWindowEnabled && !inTradeWindow()) {
+    toast("当前 " + tradeWindowText() + "，不在交易时段，已停止结算");
+    log("warn", "结算被时段闸门拦截：" + tradeWindowText());
+    return;
+  }
   state.settling = true; renderDay();
   try {
     var a = loadAccount() || resetAccount(loadSettings());
