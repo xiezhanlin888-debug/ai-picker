@@ -2362,8 +2362,8 @@ function pickRow(p, rank) {
     + "</div>"
     + '<div class="right"><div class="score" style="color:' + scoreColor(p.score) + '">' + p.score + "</div>"
     + '<div class="sub">' + scoreLabel(p.score) + "</div>"
-    + '<div class="sub" style="margin-top:4px">目标 <span class="red">' + p.targetPrice.toFixed(2) + "</span></div>"
-    + '<div class="sub">止损 <span class="green">' + p.stopPrice.toFixed(2) + "</span></div>"
+    + '<div class="sub" style="margin-top:4px">目标 <span class="red">' + (p.targetPrice > 0 ? p.targetPrice.toFixed(2) : "-") + "</span></div>"
+    + '<div class="sub">止损 <span class="green">' + (p.stopPrice > 0 ? p.stopPrice.toFixed(2) : "-") + "</span></div>"
     + '<button class="btn sm ghost" data-copy="' + esc(pickCopyText(p)) + '" style="margin-top:6px;padding:5px 10px;font-size:11px">复制</button>'
     + "</div></div>";
 }
