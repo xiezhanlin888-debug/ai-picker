@@ -319,7 +319,7 @@ var INDICES = [
 
 var DEFAULTS = {
   baseUrl: "https://api.deepseek.com", model: "deepseek-chat", key: "",
-  targetPct: 2.5, stopPct: 2.5, maxPositions: 3, positionPct: 20,
+  targetPct: 3, stopPct: 1.5, maxPositions: 3, positionPct: 20,
   minAmount: 2, minFloatCap: 30, excludeST: true, excludeLimit: true,
   candidateCount: 30, initialCapital: 100000, costPct: 0.0005,
   strategy: "limitup", theme: "auto", autoTradeOnOpen: false,
@@ -342,6 +342,14 @@ function loadSettings() {
   var s = load("aip_settings", {});
   var out = {};
   Object.keys(DEFAULTS).forEach(function (k) { out[k] = (k in s) ? s[k] : DEFAULTS[k]; });
+  // 一次性修正：旧默认止损=目标，盈亏比 1:1 没意义 → 止损降到目标的一半
+  if (!out.rrFixed) {
+    if (out.stopPct >= out.targetPct) {
+      out.stopPct = Math.max(0.5, Math.round(out.targetPct / 2 * 10) / 10);
+      saveSettings(out);
+    }
+    out.rrFixed = true;
+  }
   return out;
 }
 function saveSettings(s) { save("aip_settings", s); }
