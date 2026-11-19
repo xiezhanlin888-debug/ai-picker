@@ -246,6 +246,7 @@ var EM_CLIST = "https://push2.eastmoney.com/api/qt/clist/get";
 var EM_ULIST = "https://push2.eastmoney.com/api/qt/ulist.np/get";
 var EM_KLINE = "https://push2his.eastmoney.com/api/qt/stock/kline/get";
 var SINA_LIST = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData";
+var SINA_JSONP = "https://money.finance.sina.com.cn/quotes_service/api/jsonp_v2.php/__CB__/Market_Center.getHQNodeData";
 var UT = "bd1d9ddb04089700cf9c27f6f7426281";
 var FS = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23";
 var FIELDS = "f2,f3,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,f20,f21,f23,f62,f100,f184";
@@ -494,6 +495,53 @@ async function netFetch(url, opts) {
   throw new Error("网络请求失败");
 }
 
+/* ============================================================
+   JSONP 通道（script 标签，彻底绕过 CORS）
+   关键：新浪 json_v2 的 ACAO 头时有时无，浏览器会随机报跳域失败；
+   jsonp_v2 始终返回任意域名可加载的 JS，且不像 fetch 那样受 CORS 约束。
+   ============================================================ */
+var _jpSeq = 0;
+function canJsonp() {
+  return typeof document !== "undefined" && !!document.head && typeof window !== "undefined";
+}
+function jsonpGet(url, cbInPath, timeoutMs) {
+  return new Promise(function (resolve, reject) {
+    if (!canJsonp()) { reject(new Error("no-jsonp")); return; }
+    var name = "__jp" + (++_jpSeq) + "_" + Math.floor(Math.random() * 99999);
+    var finalUrl = cbInPath
+      ? url.replace("__CB__", name)
+      : url + (url.indexOf("?") >= 0 ? "&" : "?") + "cb=" + name;
+    var s = document.createElement("script");
+    var settled = false;
+    var timer = setTimeout(function () { finish(new Error("JSONP 超时")); }, timeoutMs || 15000);
+    function finish(err, data) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { window[name] = function () {}; } catch (e) {}
+      try { if (s.parentNode) s.parentNode.removeChild(s); } catch (e) {}
+      if (err) reject(err); else resolve(data);
+    }
+    window[name] = function (data) { finish(null, data); };
+    s.onerror = function () { finish(new Error("JSONP 加载失败")); };
+    s.async = true;
+    s.charset = "utf-8";
+    s.src = finalUrl;
+    try { document.head.appendChild(s); } catch (e) { finish(e); }
+  });
+}
+
+/** 东财接口：支持 cb= 参数，优先 JSONP */
+async function emJson(url, retries) {
+  if (canJsonp()) {
+    try {
+      var d = await jsonpGet(url, false, 12000);
+      if (d !== undefined && d !== null) return d;
+    } catch (e) { logNet("EM jsonp 失败 " + (e && e.message ? e.message : e)); }
+  }
+  return await getJson(url, retries === undefined ? 2 : retries);
+}
+
 async function getJson(url, retries, headers) {
   retries = (retries === undefined) ? 2 : retries;
   var err = null;
@@ -584,34 +632,69 @@ function sinaToQuote(r) {
 }
 
 async function sinaPage(page) {
-  var url = SINA_LIST + "?page=" + page + "&num=" + PAGE_SIZE + "&sort=symbol&asc=1&node=hs_a&symbol=&_s_r_a=page";
-  var arr = await getJson(url, 1, { Referer: "https://finance.sina.com.cn/" });
+  var q = "?page=" + page + "&num=" + PAGE_SIZE + "&sort=symbol&asc=1&node=hs_a&symbol=&_s_r_a=page";
+  // 1) JSONP（稳定，不受 ACAO 缺失影响）
+  if (canJsonp()) {
+    try {
+      var arr2 = await jsonpGet(SINA_JSONP + q, true, 14000);
+      if (Array.isArray(arr2) && arr2.length) return arr2.map(sinaToQuote).filter(function (q2) { return q2.code && q2.name; });
+      if (Array.isArray(arr2)) return [];
+    } catch (e) { logNet("sina jsonp p" + page + " 失败 " + (e && e.message ? e.message : e)); }
+  }
+  // 2) 普通 JSON（带 ACAO 时可用）
+  var arr = await getJson(SINA_LIST + q, 1, { Referer: "https://finance.sina.com.cn/" });
   if (!Array.isArray(arr)) return [];
   return arr.map(sinaToQuote).filter(function (q) { return q.code && q.name; });
 }
 
 async function sinaSnapshot(onP) {
   var all = [];
-  var page = 1, stop = false;
-  var guess = 5600;
   var BATCH = 8;
-  while (!stop && page <= 96) {
-    var batch = [];
-    for (var i = 0; i < BATCH; i++) batch.push(page + i);
-    var res = await Promise.all(batch.map(function (p) {
-      return sinaPage(p).catch(function () { return []; });
+  var MAXP = 62;              // ~5600 只 / 100 页
+  var emptyStreak = 0;
+  var failed = [];
+
+  for (var page = 1; page <= MAXP; page += BATCH) {
+    var nums = [];
+    for (var i = 0; i < BATCH && page + i <= MAXP; i++) nums.push(page + i);
+    var res = await Promise.all(nums.map(function (p) {
+      return sinaPage(p).then(function (r) { return r; }).catch(function () { return null; });
     }));
-    var shortOne = false;
-    res.forEach(function (rows) {
-      if (rows.length < PAGE_SIZE) shortOne = true;
-      rows.forEach(function (q) { all.push(q); });
+    var got = 0;
+    res.forEach(function (rows, k) {
+      if (rows === null) { failed.push(nums[k]); return; }   // 失败页稍后重试
+      if (rows.length) { got += rows.length; }
+      for (var m = 0; m < rows.length; m++) all.push(rows[m]);
     });
-    page += BATCH;
-    if (shortOne) stop = true;
-    if (onP) onP(Math.min(all.length, guess), guess);
+    if (got === 0) { emptyStreak++; if (emptyStreak >= 2 && all.length) break; }
+    else emptyStreak = 0;
+    if (onP) onP(Math.min(all.length, 5600), 5600);
   }
+
+  // 失败页重试一轮
+  if (failed.length) {
+    logNet("新浪 " + failed.length + " 页失败，重试中");
+    for (var f = 0; f < failed.length; f += 6) {
+      var chunk = failed.slice(f, f + 6);
+      var rs = await Promise.all(chunk.map(function (p) {
+        return sinaPage(p).catch(function () { return null; });
+      }));
+      rs.forEach(function (rows) { if (rows) for (var m = 0; m < rows.length; m++) all.push(rows[m]); });
+    }
+  }
+
   if (!all.length) throw new Error("新浪快照无数据");
-  return all;
+
+  // 去重
+  var seen = {}, out = [];
+  for (var z = 0; z < all.length; z++) {
+    var q = all[z];
+    if (!q.code || seen[q.code]) continue;
+    seen[q.code] = 1;
+    out.push(q);
+  }
+  if (out.length < 1000) logNet("新浪快照偏少：" + out.length + " 只（失败页 " + failed.length + "）");
+  return out;
 }
 
 /* ============================================================
@@ -651,7 +734,7 @@ async function fetchKlines(market, code, limit) {
   var url = EM_KLINE + "?secid=" + market + "." + code +
     "&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61" +
     "&klt=101&fqt=1&end=20500101&lmt=" + limit;
-  var j = await getJson(url, 2);
+  var j = await emJson(url, 2);
   var raw = j && j.data && j.data.klines;
   if (!Array.isArray(raw)) return [];
   var bars = [];
@@ -674,7 +757,7 @@ async function fetchQuotes(secids) {
     var param = chunk.map(function (c) { return c.market + "." + c.code; }).join(",");
     var url = EM_ULIST + "?fltt=2&invt=2&secids=" + param + "&fields=" + FIELDS + "&ut=" + UT;
     try {
-      var j = await getJson(url, 1);
+      var j = await emJson(url, 1);
       var rows = j && j.data && j.data.diff;
       if (Array.isArray(rows)) rows.forEach(function (r) {
         var q = toQuote(r);
@@ -2693,26 +2776,54 @@ async function testAI() {
 async function netSelfTest() {
   var out = document.getElementById("netOut");
   if (!out) return;
-  out.innerHTML = '<span class="spin"></span> 检测中…';
+  out.innerHTML = '<span class="spin"></span> 逐项检测中（约 15 秒）…';
   var lines = [];
-  lines.push("环境：" + (NATIVE_HTTP ? "原生 HTTP（免 CORS）" : "浏览器 fetch"));
+  function add(t) { lines.push(t); out.innerHTML = lines.map(function (l) { return "<div style='margin:3px 0'>" + esc(l) + "</div>"; }).join(""); }
+
+  add("环境：" + (NATIVE_HTTP ? "原生 HTTP" : "浏览器") + (canJsonp() ? " · JSONP 可用" : " · JSONP 不可用"));
+
+  // 1) JSONP 通道
+  if (canJsonp()) {
+    try {
+      var t1 = Date.now();
+      var a = await jsonpGet(SINA_JSONP + "?page=1&num=20&sort=symbol&asc=1&node=hs_a&symbol=&_s_r_a=page", true, 12000);
+      add("新浪 JSONP：" + (Array.isArray(a) && a.length ? "✓ " + a.length + " 条 · " + (Date.now() - t1) + "ms" : "✗ 空数据"));
+    } catch (e) { add("新浪 JSONP：✗ " + (e && e.message ? e.message : e)); }
+    try {
+      var b = await jsonpGet(EM_ULIST + "?fltt=2&invt=2&secids=1.600519&fields=f2,f3,f12,f14", false, 12000);
+      add("东财 JSONP：" + (b && b.data ? "✓ 正常" : "✗ 异常"));
+    } catch (e) { add("东财 JSONP：✗ " + (e && e.message ? e.message : e)); }
+  }
+
+  // 2) fetch 通道（看 CORS）
   try {
-    var t0 = Date.now();
+    var t2 = Date.now();
+    var r = await netFetch(SINA_LIST + "?page=1&num=100&sort=symbol&asc=1&node=hs_a&symbol=&_s_r_a=page", { timeout: 12000 });
+    var txt = await r.text();
+    add("新浪 fetch：" + (txt && txt.length > 1000 ? "✓ " + txt.length + "B · " + (Date.now() - t2) + "ms" : "✗ 空/被拦"));
+  } catch (e) { add("新浪 fetch：✗ " + (e && e.message ? e.message : e) + "（典型 CORS 拦截）"); }
+
+  // 3) 整体快照
+  try {
+    var t3 = Date.now();
     var q = await fetchSnapshot(null, true);
-    lines.push("全市场快照：✓ " + q.length + " 只 · 源 " + (state.source || "?") + " · " + (Date.now() - t0) + "ms");
-  } catch (e) { lines.push("全市场快照：✗ " + (e && e.message ? e.message : String(e))); }
+    add("全市场快照：" + (q.length > 1000 ? "✓ " : "⚠ ") + q.length + " 只 · 源 " + (state.source || "?") + " · " + (Date.now() - t3) + "ms");
+  } catch (e) { add("全市场快照：✗ " + (e && e.message ? e.message : String(e))); }
+
+  // 4) K 线
   try {
     var k = await fetchKlines(1, "600519", 5);
-    lines.push("K线：✓ " + (k.length ? k.length + " 根" : "空"));
-  } catch (e) { lines.push("K线：✗ " + (e && e.message ? e.message : String(e))); }
+    add("K线：" + (k.length ? "✓ " + k.length + " 根" : "✗ 空"));
+  } catch (e) { add("K线：✗ " + (e && e.message ? e.message : String(e))); }
+
+  // 5) AI
   var st = loadSettings();
-  if (!st.key) lines.push("AI 接口：未填写 Key");
+  if (!st.key) add("AI 接口：未填写 Key");
   else {
-    try { var s = await aiChat("只回复两个字：正常", st); lines.push("AI 接口：✓ " + s.slice(0, 20)); }
-    catch (e) { lines.push("AI 接口：✗ " + (e && e.message ? e.message : String(e))); }
+    try { var s = await aiChat("只回复两个字：正常", st); add("AI 接口：✓ " + s.slice(0, 20)); }
+    catch (e) { add("AI 接口：✗ " + (e && e.message ? e.message : String(e))); }
   }
-  if (NET_LOG.length) lines.push("最近错误：" + NET_LOG.slice(-2).join(" ｜ "));
-  out.innerHTML = lines.map(function (l) { return "<div style='margin:3px 0'>" + esc(l) + "</div>"; }).join("");
+  if (NET_LOG.length) add("最近错误：" + NET_LOG.slice(-2).join(" ｜ "));
 }
 
 function exportData() {
