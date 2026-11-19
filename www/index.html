@@ -447,7 +447,9 @@ try {
 } catch (e) { NATIVE_HTTP = null; }
 
 var NET_LOG = [];
+var NET_QUIET = false;   // 自检探针期间静音，避免把“预期失败”写进错误列表
 function logNet(msg) {
+  if (NET_QUIET) return;
   NET_LOG.push(new Date().toTimeString().slice(0, 8) + " " + msg);
   if (NET_LOG.length > 30) NET_LOG.shift();
 }
@@ -2795,19 +2797,24 @@ async function netSelfTest() {
     } catch (e) { add("东财 JSONP：✗ " + (e && e.message ? e.message : e)); }
   }
 
-  // 2) fetch 通道（看 CORS）
+  // 2) fetch 通道（仅作兵底，失败属正常）
+  var fetchOk = false;
+  NET_QUIET = true;
   try {
     var t2 = Date.now();
     var r = await netFetch(SINA_LIST + "?page=1&num=100&sort=symbol&asc=1&node=hs_a&symbol=&_s_r_a=page", { timeout: 12000 });
     var txt = await r.text();
-    add("新浪 fetch：" + (txt && txt.length > 1000 ? "✓ " + txt.length + "B · " + (Date.now() - t2) + "ms" : "✗ 空/被拦"));
-  } catch (e) { add("新浪 fetch：✗ " + (e && e.message ? e.message : e) + "（典型 CORS 拦截）"); }
+    if (txt && txt.length > 1000) { fetchOk = true; add("新浪 fetch：○ " + txt.length + "B · " + (Date.now() - t2) + "ms（兵底可用）"); }
+    else add("新浪 fetch：○ 空响应（不影响，JSONP 已承担）");
+  } catch (e) { add("新浪 fetch：○ 被 CORS 拦（正常，JSONP 已承担取数）"); }
+  NET_QUIET = false;
 
   // 3) 整体快照
   try {
     var t3 = Date.now();
     var q = await fetchSnapshot(null, true);
-    add("全市场快照：" + (q.length > 1000 ? "✓ " : "⚠ ") + q.length + " 只 · 源 " + (state.source || "?") + " · " + (Date.now() - t3) + "ms");
+    var mark = q.length > 4000 ? "✓" : (q.length > 1000 ? "○" : "⚠");
+    add("全市场快照：" + mark + " " + q.length + " 只 · 源 " + (state.source || "?") + " · " + (Date.now() - t3) + "ms");
   } catch (e) { add("全市场快照：✗ " + (e && e.message ? e.message : String(e))); }
 
   // 4) K 线
@@ -2818,12 +2825,19 @@ async function netSelfTest() {
 
   // 5) AI
   var st = loadSettings();
-  if (!st.key) add("AI 接口：未填写 Key");
+  if (!st.key) add("AI 接口：⚠ 未填写 Key（去「设置 → AI 引擎」填 DeepSeek Key）");
   else {
     try { var s = await aiChat("只回复两个字：正常", st); add("AI 接口：✓ " + s.slice(0, 20)); }
     catch (e) { add("AI 接口：✗ " + (e && e.message ? e.message : String(e))); }
   }
   if (NET_LOG.length) add("最近错误：" + NET_LOG.slice(-2).join(" ｜ "));
+
+  // 结论
+  var snapOk = false;
+  try { snapOk = state.quotes && state.quotes.length > 1000; } catch (e) {}
+  add("———");
+  if (snapOk) add("结论：✓ 行情链路正常（JSONP）" + (st.key ? " · AI 已配置" : " · 仅差 AI Key"));
+  else add("结论：✗ 行情未拉通，请看上面哪一项是 ✗");
 }
 
 function exportData() {
